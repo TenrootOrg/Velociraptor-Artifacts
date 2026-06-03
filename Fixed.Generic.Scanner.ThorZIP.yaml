@@ -17,6 +17,9 @@ description: |
 author: Paul Hager - @pH_T__ (Nextron Systems)
 
 type: CLIENT
+required_permissions:
+  - EXECVE
+  - FILESYSTEM_WRITE
 
 precondition: SELECT OS FROM info() where OS = 'windows' or OS = "linux" or OS = "darwin"
 
