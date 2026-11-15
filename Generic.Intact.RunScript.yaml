@@ -1,0 +1,287 @@
+name: Generic.Intact.RunScript
+author: Intact.AI
+description: |
+  Run a script on endpoints and bring back everything it produced, merged
+  across the hunt.
+
+  * Windows runs it with Windows PowerShell, Linux always with bash (a shebang
+    line is ignored; CRLF line ends are converted). The client runs as
+    SYSTEM / root, so the script does too.
+  * Processes the script leaves running are killed when it exits on Linux
+    (not those it detaches with setsid); on Windows they keep running.
+    Symbolic links in INTACT_OUT are listed, never followed.
+  * Whatever the script PRINTS is captured. Files it should hand back go into
+    the folder named by the INTACT_OUT environment variable (subfolders too):
+      PowerShell:  $data | Export-Csv "$env:INTACT_OUT\users.csv" -NoTypeInformation -Encoding UTF8
+      bash:        ps aux > "$INTACT_OUT/processes.txt"
+  * .csv, .json and .jsonl files are parsed into rows (UTF-8 or UTF-16, with or
+    without BOM), so a hunt shows one merged table of every endpoint's rows.
+    Every file, and stdout / stderr, is also uploaded as-is.
+  * It never fails silently. Every endpoint returns exactly one
+    IntactRow=Execution row, and it comes FIRST, before any upload or parsing
+    that could be cut short. Status is one of:
+      Success, Failed, TimedOut, Blocked (antivirus / AMSI / execution policy),
+      HashMismatch (not run), NotStarted (no script, or no interpreter),
+      Skipped (not the hunt's TargetOS, or an OS other than Windows / Linux).
+    It carries the exit code, timing, the script's SHA-256, a Hint and the
+    start of stderr. Problems are also written to the flow log.
+  * ScriptSHA256 checks the script arrived intact: an endpoint refuses to run
+    it if the two differ. (Both come in the same request, so this guards
+    against corruption and mistakes, not a malicious server.)
+
+  Rows carry an IntactRow column: Execution, File (one per output file, and
+  for stdout / stderr) or Row (parsed data; IntactFile names the file, relative
+  to INTACT_OUT). Server.Intact.RunScript fetches a script from a URL and
+  starts the hunt with it.
+
+type: CLIENT
+
+required_permissions:
+  - EXECVE
+
+# Temp script, wrapper and output files. EXECVE already allows far more.
+implied_permissions:
+  - FILESYSTEM_WRITE
+
+# The script has its own timeout (TimeoutSec). Without this, a direct
+# collection is cut at Velociraptor's default 600 s -- the same as TimeoutSec --
+# and returns no rows at all while the script keeps running. Hunts set their own.
+resources:
+  timeout: 86400
+
+parameters:
+  - name: Script
+    description: The script to run (PowerShell on Windows, bash on Linux).
+  - name: ScriptName
+    description: A name for the script, kept in the results.
+    default: script
+  - name: ScriptURL
+    description: Where the script came from (recorded only, never fetched here).
+  - name: ScriptSHA256
+    description: If set, refuse to run a script whose SHA-256 differs.
+  - name: TargetOS
+    description: windows or linux. Set by Server.Intact.RunScript; other endpoints report Skipped.
+  - name: TimeoutSec
+    description: Kill the script after this many seconds.
+    type: int
+    default: "600"
+  - name: MaxFileMB
+    description: Files larger than this are listed but not uploaded or parsed.
+    type: int
+    default: "100"
+  - name: PowerShellExe
+    default: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+  - name: BashExe
+    default: /bin/bash
+
+sources:
+  - query: |
+      LET OSRows <= SELECT OS FROM info()
+      LET OSName <= OSRows[0].OS
+      LET IsWin <= OSName = 'windows'
+      LET Supported <= OSName in ('windows', 'linux')
+      LET RightOS <= NOT TargetOS OR lowcase(string=TargetOS) = OSName
+      LET MaxBytes <= MaxFileMB * 1024 * 1024
+
+      -- The approved script, and the text actually written to disk: a BOM already
+      -- in the script is dropped (Windows gets exactly one, below) and CRLF line
+      -- ends become LF on Linux, where bash would choke on the \r. The hash is
+      -- always of the script as sent.
+      LET ActualSHA256 <= hash(path=Script || '', accessor='data').SHA256
+      LET HashOK <= NOT ScriptSHA256 OR lowcase(string=ScriptSHA256) = ActualSHA256
+      LET Body <= regex_replace(source=Script || '', re='^\\x{feff}', replace='')
+      LET ScriptText <= if(condition=IsWin, then=unhex(string='efbbbf') + Body,
+                           else=regex_replace(source=Body, re='\r\n', replace='\n'))
+
+      LET Runnable <= Supported AND RightOS AND Script AND HashOK
+
+      LET OutDir <= tempdir()
+      LET WorkDir <= tempdir()
+      LET OutDepth <= len(list=pathspec(parse=OutDir).Components)
+      LET StdoutPath <= path_join(components=[WorkDir, 'stdout.txt'])
+      LET StderrPath <= path_join(components=[WorkDir, 'stderr.txt'])
+      LET ScriptPath <= if(condition=Runnable, then=tempfile(data=ScriptText,
+          extension=if(condition=IsWin, then='.ps1', else='.sh')))
+
+      -- The wrappers enforce the timeout and send the script's own output to
+      -- files, so any size is captured and nothing is lost on a kill.
+      -- Windows: cmd.exe redirects at the OS level. PowerShell's own
+      -- Start-Process -Redirect* copies through a pipe that a background child
+      -- inherits, and the wrapper's wait then hangs on it (measured).
+      LET WinWrapper <= if(condition=Runnable AND IsWin, then=tempfile(extension='.ps1', data='''
+      param([string]$Script, [string]$StdOut, [string]$StdErr, [int]$TimeoutSec)
+      $exe = (Get-Process -Id $PID).Path
+      $psi = New-Object System.Diagnostics.ProcessStartInfo
+      $psi.FileName = $env:ComSpec
+      $psi.Arguments = '/d /s /c ""{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{1}" <NUL >"{2}" 2>"{3}""' -f $exe, $Script, $StdOut, $StdErr
+      $psi.UseShellExecute = $false
+      $psi.CreateNoWindow = $true
+      try { $p = [System.Diagnostics.Process]::Start($psi) }
+      catch { [Console]::Error.WriteLine("could not start the script: $_"); exit 125 }
+      if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+          & taskkill.exe /T /F /PID $p.Id 2>&1 | Out-Null
+          exit 124
+      }
+      exit $p.ExitCode
+      '''))
+      LET Argv <= if(condition=IsWin,
+          then=[PowerShellExe, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                '-File', WinWrapper, '-Script', ScriptPath, '-StdOut', StdoutPath,
+                '-StdErr', StderrPath, '-TimeoutSec', str(str=TimeoutSec)],
+          -- Linux: timeout leads its own process group; after the script exits,
+          -- whatever it left running in that group is killed too (setsid escapes).
+          else=[BashExe, '-c', 'timeout -k 10 "$4" "$0" "$1" <"/dev/null" >"$2" 2>"$3" & p=$!; wait $p; rc=$?; kill -KILL -- -$p 2>/dev/null; exit $rc',
+                BashExe, ScriptPath, StdoutPath, StderrPath, str(str=TimeoutSec)])
+
+      -- execve's env REPLACES the environment: pass the client's own (SystemRoot,
+      -- PATH, COMPUTERNAME, TEMP...) plus INTACT_OUT, or scripts lose them all.
+      LET BaseEnv <= SELECT * FROM environ()
+      LET StartTime <= now()
+      LET _Log1 <= log(message='Intact.RunScript: %v (sha256 %v) on %v, timeout %vs',
+                       args=[ScriptName, ActualSHA256, OSName, TimeoutSec])
+      LET Exec <= if(condition=Runnable,
+          then={ SELECT ReturnCode, Stdout, Stderr, Complete
+                 FROM execve(argv=Argv, env=BaseEnv[0] + dict(INTACT_OUT=OutDir), cwd=WorkDir, length=100000) })
+      LET EndTime <= now()
+      LET Elapsed <= EndTime - StartTime
+      LET Done <= SELECT ReturnCode, Stderr FROM Exec WHERE Complete
+      LET ExitCode <= if(condition=Done, then=Done[0].ReturnCode)
+
+      LET StdoutSize <= stat(filename=StdoutPath).Size || 0
+      LET StderrSize <= stat(filename=StderrPath).Size || 0
+      LET StderrText <= read_file(filename=StderrPath, length=4096) || Done[0].Stderr || ''
+      LET StderrTail <= if(condition=StderrSize > 4096,
+          then=read_file(filename=StderrPath, offset=StderrSize - 4096, length=4096), else='')
+
+      -- Killed by the wrapper: it ran out its time (124, or 137 when it also
+      -- ignored SIGTERM). Judged by the clock, so a script that itself exits 124
+      -- is not "timed out".
+      LET TimedOut <= Done AND ExitCode != 0 AND Elapsed >= TimeoutSec
+      -- Only what really means "something stopped it from running". A plain
+      -- "permission denied" from a command the script ran is a Failed with a hint.
+      LET Blocked <= ExitCode != 0 AND (StderrText + StderrTail) =~ '(?i)(contains malicious content|contains a virus|potentially unwanted software|blocked by your antivirus|running scripts is disabled|AuthorizationManager check failed)'
+      LET Denied <= (StderrText + StderrTail) =~ '(?i)(access is denied|permission denied)'
+
+      LET Status <= if(condition=NOT Supported OR NOT RightOS, then='Skipped',
+          else=if(condition=NOT Script, then='NotStarted',
+          else=if(condition=NOT HashOK, then='HashMismatch',
+          else=if(condition=NOT Done, then='NotStarted',
+          else=if(condition=TimedOut, then='TimedOut',
+          else=if(condition=Blocked, then='Blocked',
+          else=if(condition=ExitCode = 0, then='Success', else='Failed')))))))
+      LET Hint <= if(condition=NOT Supported, then=format(format='%v is not supported (Windows and Linux only)', args=OSName),
+          else=if(condition=NOT RightOS, then=format(format='this hunt targets %v', args=TargetOS),
+          else=if(condition=NOT Script, then='no script was given',
+          else=if(condition=NOT HashOK, then='the script does not match ScriptSHA256; it was not run',
+          else=if(condition=NOT Done, then='the interpreter could not be started',
+          else=if(condition=TimedOut, then=format(format='killed after %v s (TimeoutSec)', args=TimeoutSec),
+          else=if(condition=Blocked, then='blocked: antivirus/AMSI or execution policy (see StderrHead)',
+          else=if(condition=ExitCode != 0 AND Denied, then='a command was denied access (see StderrHead)',
+          else=if(condition=ExitCode = 137 OR ExitCode = -1, then='killed by a signal',
+          else=if(condition=ExitCode = 0 AND StderrSize > 0, then='exit 0, but the script wrote to stderr (see StderrHead)',
+          else=''))))))))))
+
+      LET _Log2 <= log(level=if(condition=Status in ('Success', 'Skipped'), then='DEFAULT', else='WARN'),
+                       message='Intact.RunScript: %v exit=%v in %v s. %v',
+                       args=[Status, ExitCode, Elapsed, Hint])
+
+      -- The script's output files, by path under INTACT_OUT (a/data.csv and
+      -- b/data.csv stay apart). Field names a script's own columns will not
+      -- shadow (a CSV with a Name or Type column is common).
+      LET OutFiles <= SELECT OSPath AS IntactPath,
+             join(array=OSPath.Components[OutDepth:], sep='/') AS IntactFile, Size AS IntactSize,
+             lowcase(string=if(condition=Name =~ '\\.[^.]+$',
+                               then=regex_replace(source=Name, re='^.*\\.', replace=''), else='')) AS IntactExt
+        FROM glob(globs='**', root=OutDir, nosymlink=TRUE) WHERE NOT IsDir AND NOT IsLink
+
+      -- Text of a file as UTF-8, whatever PowerShell wrote: UTF-16 LE (FF FE),
+      -- UTF-8 with BOM, or plain. Export-Csv's "#TYPE ..." first line is dropped.
+      LET Utf8(Path) = regex_replace(re='^\\x{feff}(#TYPE [^\n]*\n)?|^#TYPE [^\n]*\n', replace='',
+          source=if(condition=format(format='%x', args=read_file(filename=Path, length=2)) = 'fffe',
+                    then=utf16(string=read_file(filename=Path, length=MaxBytes, offset=2)),
+                    else=read_file(filename=Path, length=MaxBytes)))
+
+      -- Parsed rows of one file; the file is read once per call. A file that
+      -- does not parse gives no rows (and a Note), never an error that stops
+      -- the other files.
+      LET ParseFile(Path, Ext) = SELECT * FROM foreach(
+          row={ SELECT Utf8(Path=Path) AS T FROM scope() },
+          query={ SELECT * FROM switch(
+            a={ SELECT * FROM if(condition=Ext = 'csv',
+                  then={ SELECT * FROM parse_csv(filename=T, accessor='data') }) },
+            b={ SELECT * FROM if(condition=Ext = 'json' AND T =~ '^\\s*\\[',
+                  then={ SELECT * FROM parse_json_array(data=T) }) },
+            c={ SELECT * FROM if(condition=Ext = 'json' AND T =~ '^\\s*\\{',
+                  then={ SELECT * FROM foreach(row=parse_json(data=T)) }) },
+            d={ SELECT * FROM if(condition=Ext = 'jsonl',
+                  then={ SELECT * FROM parse_jsonl(filename=T, accessor='data') }) }) })
+
+      LET Parseable(Ext) = Ext in ('csv', 'json', 'jsonl')
+      -- len() of a query is always 0 in VQL; a grouped count() is the row total.
+      LET CountRows(Path, Ext) = SELECT count() AS n FROM ParseFile(Path=Path, Ext=Ext) GROUP BY 1
+
+      -- stdout / stderr: always kept in full (rows for them come with the files).
+      LET LogFiles = SELECT * FROM chain(
+          a={ SELECT 'File' AS IntactRow, 'intact/stdout.txt' AS IntactFile, StdoutSize AS Size,
+                     'stdout' AS Kind, NULL AS RowsParsed,
+                     upload(file=StdoutPath, name='intact/stdout.txt').sha256 AS UploadedSHA256, '' AS Note
+              FROM scope() WHERE StdoutSize > 0 },
+          b={ SELECT 'File' AS IntactRow, 'intact/stderr.txt' AS IntactFile, StderrSize AS Size,
+                     'stderr' AS Kind, NULL AS RowsParsed,
+                     upload(file=StderrPath, name='intact/stderr.txt').sha256 AS UploadedSHA256, '' AS Note
+              FROM scope() WHERE StderrSize > 0 })
+
+      -- One row per output file, evaluated per file so its fields are in scope.
+      LET FileRows = SELECT * FROM foreach(row=OutFiles, query={
+          SELECT 'File' AS IntactRow, IntactFile, IntactSize AS Size, Kind, RowsParsed,
+                 UploadedSHA256,
+                 if(condition=IntactSize > MaxBytes,
+                    then=format(format='over MaxFileMB (%v MB): listed only', args=MaxFileMB),
+                 else=if(condition=Kind != 'other' AND IntactSize > 0 AND NOT RowsParsed,
+                    then=format(format='no rows parsed (not valid %v, or headers only): uploaded as-is', args=Kind),
+                 else='')) AS Note
+          FROM foreach(row={
+              SELECT if(condition=Parseable(Ext=IntactExt), then=IntactExt, else='other') AS Kind,
+                     if(condition=IntactSize <= MaxBytes AND Parseable(Ext=IntactExt),
+                        then=CountRows(Path=IntactPath, Ext=IntactExt)[0].n || 0) AS RowsParsed,
+                     if(condition=IntactSize <= MaxBytes,
+                        then=upload(file=IntactPath, name='out/' + IntactFile).sha256) AS UploadedSHA256
+              FROM scope() }) })
+
+      -- The Execution row goes first, so it reaches the server even if an upload
+      -- or a huge file later hits a limit.
+      SELECT * FROM chain(
+        a={ SELECT 'Execution' AS IntactRow, Status, ExitCode, Hint,
+                   StartTime, EndTime, Elapsed AS DurationSec,
+                   ScriptName, ScriptURL, ActualSHA256 AS ScriptSHA256,
+                   ScriptSHA256 AS ExpectedSHA256, OSName AS OS, TargetOS,
+                   StdoutSize AS StdoutBytes, StderrSize AS StderrBytes,
+                   format(format='%.1000s', args=StderrText) AS StderrHead,
+                   len(list=OutFiles) AS OutputFiles
+            FROM scope() },
+        b={ SELECT * FROM LogFiles },
+        c={ SELECT * FROM FileRows },
+        d={ SELECT * FROM foreach(row=OutFiles,
+              query={ SELECT 'Row' AS IntactRow, IntactFile, *
+                      FROM if(condition=IntactSize <= MaxBytes AND Parseable(Ext=IntactExt),
+                              then={ SELECT * FROM ParseFile(Path=IntactPath, Ext=IntactExt) }) }) })
+
+    notebook:
+      - type: vql_suggestion
+        name: Status per endpoint
+        template: |
+          /*
+          # Execution status per endpoint
+          */
+          SELECT ClientId, client_info(client_id=ClientId).os_info.hostname AS Hostname,
+                 Status, ExitCode, Hint, DurationSec, ScriptName, ScriptSHA256, StderrHead
+          FROM source() WHERE IntactRow = 'Execution'
+          ORDER BY Status
+      - type: vql_suggestion
+        name: Merged results
+        template: |
+          /*
+          # Every endpoint's parsed rows, in one table
+          */
+          SELECT client_info(client_id=ClientId).os_info.hostname AS Hostname, *
+          FROM source() WHERE IntactRow = 'Row'
